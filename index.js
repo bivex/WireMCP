@@ -9,6 +9,39 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
 
+/*
+==============================================
+TLS AUTO-DECRYPTION SETUP GUIDE
+==============================================
+
+WireMCP now supports automatic TLS decryption using two methods:
+
+1. SSL KEYLOG METHOD (Browser Traffic):
+   - Set environment variable: SSLKEYLOGFILE=./keylog.txt
+   - Chrome automatically writes to this file
+   - Firefox: Enable in about:config
+   - Use capture_tls_decrypt tool with sslKeylogFile parameter
+
+2. PRIVATE KEY METHOD (Server Traffic):
+   - Obtain server's private key (.key or .pem file)
+   - Use capture_tls_decrypt or decrypt_raw_data tools
+   - Specify privateKeyFile and port parameters
+   - For encrypted keys, provide privateKeyPassword
+
+Example Environment Setup:
+   Windows: set SSLKEYLOGFILE=C:\path\to\keylog.txt
+   Linux/Mac: export SSLKEYLOGFILE=/path/to/keylog.txt
+
+Example Usage:
+   capture_tls_decrypt({
+     interface: "en0", 
+     duration: 30,
+     sslKeylogFile: "./keylog.txt"
+   })
+
+==============================================
+*/
+
 // Redirect console.log to stderr
 const originalConsoleLog = console.log;
 console.log = (...args) => console.error(...args);
@@ -60,7 +93,7 @@ server.tool(
       console.error(`Capturing packets on ${interface} for ${duration}s`);
 
       await execAsync(
-        `"${tsharkPath}" -i "${interface}" -w "${tempPcap}" -a duration:${duration}`,
+        `"${tsharkPath}" -i ${interface} -w ${tempPcap} -a duration:${duration}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
@@ -112,7 +145,7 @@ server.tool(
       console.error(`Capturing summary stats on ${interface} for ${duration}s`);
 
       await execAsync(
-        `"${tsharkPath}" -i "${interface}" -w "${tempPcap}" -a duration:${duration}`,
+        `"${tsharkPath}" -i ${interface} -w ${tempPcap} -a duration:${duration}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
@@ -153,7 +186,7 @@ server.tool(
       console.error(`Capturing conversations on ${interface} for ${duration}s`);
 
       await execAsync(
-        `"${tsharkPath}" -i "${interface}" -w "${tempPcap}" -a duration:${duration}`,
+        `"${tsharkPath}" -i ${interface} -w ${tempPcap} -a duration:${duration}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
@@ -194,7 +227,7 @@ server.tool(
       console.error(`Capturing traffic on ${interface} for ${duration}s to check threats`);
 
       await execAsync(
-        `"${tsharkPath}" -i "${interface}" -w "${tempPcap}" -a duration:${duration}`,
+        `"${tsharkPath}" -i ${interface} -w ${tempPcap} -a duration:${duration}`,
         { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
       );
 
@@ -361,7 +394,401 @@ server.tool(
   }
 );
 
-// Tool 7: Extract credentials from a PCAP file
+// Tool 7: Decrypt and extract raw source data from packets with TLS decryption
+server.tool(
+  'decrypt_raw_data',
+  'Extract and decrypt raw packet data, payloads, and encrypted content from a PCAP file with TLS decryption support',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file to analyze (e.g., ./demo.pcap)'),
+    protocol: z.string().optional().default('all').describe('Protocol to focus on: tcp, udp, http, tls, all'),
+    maxPackets: z.number().optional().default(50).describe('Maximum number of packets to analyze (1-200)'),
+    sslKeylogFile: z.string().optional().describe('Path to SSL keylog file for TLS decryption (e.g., ./keylog.txt)'),
+    privateKeyFile: z.string().optional().describe('Path to private key file for TLS decryption (e.g., ./server.key)'),
+    privateKeyPassword: z.string().optional().describe('Password for encrypted private key file'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { pcapPath, protocol, maxPackets, sslKeylogFile, privateKeyFile, privateKeyPassword } = args;
+      console.error(`Extracting raw data from PCAP file: ${pcapPath}, protocol: ${protocol}, max packets: ${maxPackets}`);
+      
+      if (sslKeylogFile) console.error(`Using SSL keylog file: ${sslKeylogFile}`);
+      if (privateKeyFile) console.error(`Using private key file: ${privateKeyFile}`);
+
+      await fs.access(pcapPath);
+      
+      // Build TLS decryption options
+      let tlsOptions = '';
+      if (sslKeylogFile) {
+        await fs.access(sslKeylogFile);
+        tlsOptions += ` -o "tls.keylog_file:${sslKeylogFile}"`;
+      }
+      if (privateKeyFile) {
+        await fs.access(privateKeyFile);
+        tlsOptions += ` -o "tls.keys_list:0.0.0.0,443,http,${privateKeyFile}"`;
+        if (privateKeyPassword) {
+          tlsOptions += ` -o "tls.keystore_password:${privateKeyPassword}"`;
+        }
+      }
+
+      // Extract raw packet data with payloads
+      const { stdout: rawData } = await execAsync(
+        `"${tsharkPath}" -r "${pcapPath}" -T fields -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e tcp.payload -e udp.payload -e data.data -e frame.protocols -c ${maxPackets}`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      // Extract TLS/SSL data if present
+      const { stdout: tlsData } = await execAsync(
+        `"${tsharkPath}" -r "${pcapPath}" -T fields -e frame.number -e tls.handshake.type -e tls.record.content_type -e tls.app_data -e ssl.handshake.type -e ssl.record.content_type -e ssl.app_data -c ${maxPackets}`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      // Extract HTTP data with TLS decryption if keys provided
+      const { stdout: httpData } = await execAsync(
+        `"${tsharkPath}" -r "${pcapPath}"${tlsOptions} -T fields -e frame.number -e http.request.method -e http.request.uri -e http.host -e http.user_agent -e http.request.line -e http.response.line -e http.file_data -c ${maxPackets}`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      // Extract decrypted TLS data if keys provided
+      let decryptedData = '';
+      if (tlsOptions) {
+        try {
+          const { stdout: decrypted } = await execAsync(
+            `"${tsharkPath}" -r "${pcapPath}"${tlsOptions} -T fields -e frame.number -e http2.data.data -e http.request.full_uri -e http.response.phrase -e tls.app_data_proto -c ${maxPackets}`,
+            { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+          );
+          decryptedData = decrypted;
+          console.error(`Successfully extracted decrypted TLS data`);
+        } catch (e) {
+          console.error(`TLS decryption failed: ${e.message}`);
+        }
+      }
+
+      const packets = [];
+      const rawLines = rawData.split('\n').filter(line => line.trim());
+      const tlsLines = tlsData.split('\n').filter(line => line.trim());
+      const httpLines = httpData.split('\n').filter(line => line.trim());
+
+      // Process raw packet data
+      rawLines.forEach((line, index) => {
+        const [frameNum, srcIP, dstIP, tcpSrcPort, tcpDstPort, udpSrcPort, udpDstPort, tcpPayload, udpPayload, dataPayload, protocols] = line.split('\t');
+        
+        if (!frameNum) return;
+
+        const packet = {
+          frame: frameNum,
+          src: srcIP || 'unknown',
+          dst: dstIP || 'unknown',
+          protocols: protocols || 'unknown',
+          ports: '',
+          payload: '',
+          payloadType: 'none'
+        };
+
+        // Determine ports and payload
+        if (tcpSrcPort && tcpDstPort) {
+          packet.ports = `${tcpSrcPort}->${tcpDstPort}`;
+          packet.payload = tcpPayload || '';
+          packet.payloadType = 'tcp';
+        } else if (udpSrcPort && udpDstPort) {
+          packet.ports = `${udpSrcPort}->${udpDstPort}`;
+          packet.payload = udpPayload || '';
+          packet.payloadType = 'udp';
+        } else if (dataPayload) {
+          packet.payload = dataPayload;
+          packet.payloadType = 'data';
+        }
+
+        // Add TLS data if available
+        if (index < tlsLines.length) {
+          const tlsFields = tlsLines[index].split('\t');
+          if (tlsFields[1] || tlsFields[2] || tlsFields[3]) {
+            packet.tls = {
+              handshakeType: tlsFields[1] || '',
+              contentType: tlsFields[2] || '',
+              appData: tlsFields[3] || tlsFields[6] || ''
+            };
+          }
+        }
+
+        // Add HTTP data if available
+        if (index < httpLines.length) {
+          const httpFields = httpLines[index].split('\t');
+          if (httpFields[1] || httpFields[2] || httpFields[7]) {
+            packet.http = {
+              method: httpFields[1] || '',
+              uri: httpFields[2] || '',
+              host: httpFields[3] || '',
+              userAgent: httpFields[4] || '',
+              requestLine: httpFields[5] || '',
+              responseLine: httpFields[6] || '',
+              fileData: httpFields[7] || ''
+            };
+          }
+        }
+
+        packets.push(packet);
+      });
+
+      // Filter by protocol if specified
+      const filteredPackets = protocol === 'all' ? packets : 
+        packets.filter(p => p.protocols.toLowerCase().includes(protocol.toLowerCase()));
+
+      // Analyze and decode payloads
+      const analyzedPackets = filteredPackets.map(packet => {
+        const analysis = {
+          ...packet,
+          decoded: {},
+          rawHex: '',
+          rawAscii: ''
+        };
+
+        if (packet.payload) {
+          // Convert hex to readable format
+          const hexData = packet.payload.replace(/:/g, '');
+          analysis.rawHex = hexData;
+          
+          // Convert hex to ASCII
+          let ascii = '';
+          for (let i = 0; i < hexData.length; i += 2) {
+            const byte = parseInt(hexData.substr(i, 2), 16);
+            ascii += (byte >= 32 && byte <= 126) ? String.fromCharCode(byte) : '.';
+          }
+          analysis.rawAscii = ascii;
+
+          // Attempt to decode common patterns
+          if (ascii.includes('HTTP/')) {
+            analysis.decoded.type = 'HTTP';
+            analysis.decoded.content = ascii;
+          } else if (ascii.includes('GET ') || ascii.includes('POST ')) {
+            analysis.decoded.type = 'HTTP Request';
+            analysis.decoded.content = ascii;
+          } else if (hexData.startsWith('1603') || hexData.startsWith('1503')) {
+            analysis.decoded.type = 'TLS/SSL';
+            analysis.decoded.content = 'Encrypted TLS traffic detected';
+          } else if (ascii.match(/[a-zA-Z0-9+/]{20,}={0,2}/)) {
+            analysis.decoded.type = 'Base64';
+            try {
+              analysis.decoded.content = Buffer.from(ascii.match(/[a-zA-Z0-9+/]+=*/)[0], 'base64').toString();
+            } catch (e) {
+              analysis.decoded.content = 'Base64 decode failed';
+            }
+          } else if (ascii.length > 10) {
+            analysis.decoded.type = 'Text/Binary';
+            analysis.decoded.content = ascii.substring(0, 200);
+          }
+        }
+
+        return analysis;
+      });
+
+      console.error(`Analyzed ${analyzedPackets.length} packets with raw data`);
+
+      const outputText = `Raw Data Analysis: ${pcapPath}\n` +
+        `Protocol Filter: ${protocol}\n` +
+        `Packets Analyzed: ${analyzedPackets.length}\n\n` +
+        `PACKET DETAILS:\n` +
+        `================\n\n` +
+        analyzedPackets.map(p => {
+          let output = `Frame ${p.frame}: ${p.src} -> ${p.dst}`;
+          if (p.ports) output += ` [${p.ports}]`;
+          output += `\nProtocols: ${p.protocols}\n`;
+          
+          if (p.http && (p.http.method || p.http.fileData)) {
+            output += `HTTP: ${p.http.method || 'Response'} ${p.http.uri || ''}\n`;
+            if (p.http.host) output += `Host: ${p.http.host}\n`;
+            if (p.http.fileData) output += `File Data: ${p.http.fileData.substring(0, 100)}...\n`;
+          }
+          
+          if (p.tls && p.tls.appData) {
+            output += `TLS App Data: ${p.tls.appData.substring(0, 50)}...\n`;
+          }
+          
+          if (p.rawHex) {
+            output += `Raw Hex (${p.rawHex.length/2} bytes): ${p.rawHex.substring(0, 64)}${p.rawHex.length > 64 ? '...' : ''}\n`;
+            output += `Raw ASCII: ${p.rawAscii.substring(0, 64)}${p.rawAscii.length > 64 ? '...' : ''}\n`;
+            
+            if (p.decoded.type) {
+              output += `Decoded as ${p.decoded.type}: ${p.decoded.content.substring(0, 100)}${p.decoded.content.length > 100 ? '...' : ''}\n`;
+            }
+          }
+          
+          return output + '\n';
+        }).join('---\n') +
+        `\nDECRYPTION NOTES:\n` +
+        `================\n` +
+        `- TLS/SSL traffic requires private keys for decryption\n` +
+        `- Use Wireshark with keylog files for TLS decryption\n` +
+        `- Some protocols may use custom encryption\n` +
+        `- Check for credentials in plaintext protocols first`;
+
+      return {
+        content: [{ type: 'text', text: outputText }],
+      };
+    } catch (error) {
+      console.error(`Error in decrypt_raw_data: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 8: Live capture with TLS auto-decryption
+server.tool(
+  'capture_tls_decrypt',
+  'Capture live traffic with automatic TLS decryption using keylog or private keys',
+  {
+    interface: z.string().optional().default('en0').describe('Network interface to capture from (e.g., eth0, en0)'),
+    duration: z.number().optional().default(10).describe('Capture duration in seconds'),
+    sslKeylogFile: z.string().optional().describe('Path to SSL keylog file for TLS decryption (e.g., ./keylog.txt)'),
+    privateKeyFile: z.string().optional().describe('Path to private key file for TLS decryption (e.g., ./server.key)'),
+    privateKeyPassword: z.string().optional().describe('Password for encrypted private key file'),
+    port: z.number().optional().default(443).describe('Port to associate with private key (default: 443)'),
+  },
+  async (args) => {
+    try {
+      const tsharkPath = await findTshark();
+      const { interface, duration, sslKeylogFile, privateKeyFile, privateKeyPassword, port } = args;
+      const tempPcap = 'temp_tls_capture.pcap';
+      console.error(`Capturing TLS traffic on ${interface} for ${duration}s with decryption`);
+
+      if (sslKeylogFile) console.error(`Using SSL keylog file: ${sslKeylogFile}`);
+      if (privateKeyFile) console.error(`Using private key file: ${privateKeyFile} for port ${port}`);
+
+      // Build TLS decryption options
+      let tlsOptions = '';
+      if (sslKeylogFile) {
+        try {
+          await fs.access(sslKeylogFile);
+          tlsOptions += ` -o "tls.keylog_file:${sslKeylogFile}"`;
+        } catch (e) {
+          console.error(`SSL keylog file not accessible: ${e.message}`);
+        }
+      }
+      if (privateKeyFile) {
+        try {
+          await fs.access(privateKeyFile);
+          tlsOptions += ` -o "tls.keys_list:0.0.0.0,${port},http,${privateKeyFile}"`;
+          if (privateKeyPassword) {
+            tlsOptions += ` -o "tls.keystore_password:${privateKeyPassword}"`;
+          }
+        } catch (e) {
+          console.error(`Private key file not accessible: ${e.message}`);
+        }
+      }
+
+      // Capture packets
+      await execAsync(
+        `"${tsharkPath}" -i ${interface} -w ${tempPcap} -a duration:${duration}`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      // Extract decrypted HTTP traffic
+      const { stdout: decryptedHttp, stderr } = await execAsync(
+        `"${tsharkPath}" -r "${tempPcap}"${tlsOptions} -T fields -e frame.number -e ip.src -e ip.dst -e tcp.srcport -e tcp.dstport -e http.request.method -e http.request.full_uri -e http.host -e http.user_agent -e http.response.code -e http.response.phrase -e http.file_data`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      // Extract TLS handshake info
+      const { stdout: tlsInfo } = await execAsync(
+        `"${tsharkPath}" -r "${tempPcap}"${tlsOptions} -T fields -e frame.number -e tls.handshake.type -e tls.handshake.ciphersuite -e tls.handshake.server_name -e tls.app_data_proto`,
+        { env: { ...process.env, PATH: `${process.env.PATH}:/usr/bin:/usr/local/bin:/opt/homebrew/bin` } }
+      );
+
+      if (stderr) console.error(`tshark stderr: ${stderr}`);
+
+      // Process decrypted HTTP data
+      const httpLines = decryptedHttp.split('\n').filter(line => line.trim());
+      const tlsLines = tlsInfo.split('\n').filter(line => line.trim());
+
+      const decryptedRequests = [];
+      const tlsConnections = [];
+
+      httpLines.forEach(line => {
+        const [frame, srcIP, dstIP, srcPort, dstPort, method, uri, host, userAgent, responseCode, responsePhrase, fileData] = line.split('\t');
+        
+        if (frame && (method || responseCode || fileData)) {
+          decryptedRequests.push({
+            frame,
+            src: srcIP || 'unknown',
+            dst: dstIP || 'unknown',
+            port: `${srcPort || 'unknown'}->${dstPort || 'unknown'}`,
+            method: method || '',
+            uri: uri || '',
+            host: host || '',
+            userAgent: userAgent || '',
+            responseCode: responseCode || '',
+            responsePhrase: responsePhrase || '',
+            fileData: fileData ? fileData.substring(0, 200) : ''
+          });
+        }
+      });
+
+      tlsLines.forEach(line => {
+        const [frame, handshakeType, cipherSuite, serverName, appDataProto] = line.split('\t');
+        
+        if (frame && (handshakeType || serverName)) {
+          tlsConnections.push({
+            frame,
+            handshakeType: handshakeType || '',
+            cipherSuite: cipherSuite || '',
+            serverName: serverName || '',
+            appDataProto: appDataProto || ''
+          });
+        }
+      });
+
+      await fs.unlink(tempPcap).catch(err => console.error(`Failed to delete ${tempPcap}: ${err.message}`));
+
+      const outputText = `TLS Decryption Results\n` +
+        `Interface: ${interface}, Duration: ${duration}s\n` +
+        `Decryption Keys: ${tlsOptions ? 'Provided' : 'None'}\n\n` +
+        `DECRYPTED HTTP TRAFFIC:\n` +
+        `=======================\n` +
+        (decryptedRequests.length > 0 ? 
+          decryptedRequests.map(req => 
+            `Frame ${req.frame}: ${req.src}:${req.port} -> ${req.dst}\n` +
+            `${req.method ? `${req.method} ${req.uri}` : `Response: ${req.responseCode} ${req.responsePhrase}`}\n` +
+            `${req.host ? `Host: ${req.host}\n` : ''}` +
+            `${req.userAgent ? `User-Agent: ${req.userAgent.substring(0, 50)}...\n` : ''}` +
+            `${req.fileData ? `Data: ${req.fileData}...\n` : ''}`
+          ).join('\n---\n') : 
+          'No decrypted HTTP traffic found.\n') +
+        `\nTLS HANDSHAKE INFO:\n` +
+        `==================\n` +
+        (tlsConnections.length > 0 ?
+          tlsConnections.map(tls =>
+            `Frame ${tls.frame}: ${tls.serverName || 'Unknown Server'}\n` +
+            `Handshake: ${tls.handshakeType}, Cipher: ${tls.cipherSuite}\n` +
+            `Protocol: ${tls.appDataProto || 'Unknown'}`
+          ).join('\n---\n') :
+          'No TLS handshake information found.\n') +
+        `\nDECRYPTION SETUP GUIDE:\n` +
+        `======================\n` +
+        `1. SSL Keylog Method (Browser traffic):\n` +
+        `   - Set SSLKEYLOGFILE environment variable\n` +
+        `   - Use browser keylog: export SSLKEYLOGFILE=./keylog.txt\n` +
+        `   - Pass keylog file to this tool\n\n` +
+        `2. Private Key Method (Server traffic):\n` +
+        `   - Obtain server private key (.key or .pem file)\n` +
+        `   - Specify key file and port in tool parameters\n` +
+        `   - For encrypted keys, provide password\n\n` +
+        `3. Environment Setup:\n` +
+        `   - Windows: set SSLKEYLOGFILE=C:\\path\\to\\keylog.txt\n` +
+        `   - Linux/Mac: export SSLKEYLOGFILE=/path/to/keylog.txt\n` +
+        `   - Chrome: Automatically writes to keylog file\n` +
+        `   - Firefox: Set security.tls.insecure_fallback_hosts`;
+
+      return {
+        content: [{ type: 'text', text: outputText }],
+      };
+    } catch (error) {
+      console.error(`Error in capture_tls_decrypt: ${error.message}`);
+      return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 9: Extract credentials from a PCAP file
 server.tool(
     'extract_credentials',
     'Extract potential credentials (HTTP Basic Auth, FTP, Telnet) from a PCAP file for LLM analysis',
@@ -629,6 +1056,59 @@ server.prompt(
 3. Protocols and services used
 4. Notable events or anomalies
 5. Potential security concerns`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'decrypt_raw_data_prompt',
+  {
+    pcapPath: z.string().describe('Path to the PCAP file'),
+    protocol: z.string().optional().describe('Protocol to focus on'),
+    maxPackets: z.number().optional().describe('Maximum number of packets to analyze'),
+    sslKeylogFile: z.string().optional().describe('Path to SSL keylog file'),
+    privateKeyFile: z.string().optional().describe('Path to private key file'),
+  },
+  ({ pcapPath, protocol = 'all', maxPackets = 50, sslKeylogFile, privateKeyFile }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please extract and decrypt raw packet data from the PCAP file at ${pcapPath} (protocol: ${protocol}, max packets: ${maxPackets}):
+1. Extract raw packet payloads and convert from hex to ASCII
+2. Identify and decode encrypted protocols (TLS/SSL, etc.)
+3. Analyze HTTP traffic and file transfers
+4. Detect Base64 encoded data and attempt decoding
+5. Use TLS decryption keys if provided (keylog: ${sslKeylogFile || 'none'}, private key: ${privateKeyFile || 'none'})
+6. Provide insights on data patterns and potential security issues
+7. Suggest decryption methods for encrypted traffic`
+      }
+    }]
+  })
+);
+
+server.prompt(
+  'capture_tls_decrypt_prompt',
+  {
+    interface: z.string().optional().describe('Network interface to capture from'),
+    duration: z.number().optional().describe('Duration in seconds to capture'),
+    sslKeylogFile: z.string().optional().describe('Path to SSL keylog file'),
+    privateKeyFile: z.string().optional().describe('Path to private key file'),
+  },
+  ({ interface = 'en0', duration = 10, sslKeylogFile, privateKeyFile }) => ({
+    messages: [{
+      role: 'user',
+      content: {
+        type: 'text',
+        text: `Please capture and decrypt TLS traffic on interface ${interface} for ${duration} seconds:
+1. Capture live network traffic with TLS decryption capabilities
+2. Decrypt HTTPS traffic using keylog file (${sslKeylogFile || 'not provided'}) or private keys (${privateKeyFile || 'not provided'})
+3. Extract decrypted HTTP requests, responses, and file transfers
+4. Analyze TLS handshakes and cipher suites used
+5. Identify server names and application protocols
+6. Provide security analysis of decrypted traffic
+7. Guide on proper TLS decryption setup for future captures`
       }
     }]
   })
